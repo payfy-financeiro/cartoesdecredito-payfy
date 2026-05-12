@@ -2807,8 +2807,8 @@ function displayMerchant(l) {
   return (l.merchantApelido && l.merchantApelido.trim()) || l.merchant || '';
 }
 
-// Retorna chave usada pra AGRUPAR fornecedor (usa apelido se houver, senão merchant)
-function merchantKey(l) {
+// Retorna chave usada pra AGRUPAR (display) fornecedor: usa apelido se houver, senão merchant cru
+function groupMerchantName(l) {
   if (!l) return '';
   return (l.merchantApelido && l.merchantApelido.trim()) || l.merchant || '';
 }
@@ -3908,13 +3908,16 @@ function renderTopFornecedores(items) {
     container.innerHTML = '<div class="dash-card-empty">Sem dados</div>';
     return;
   }
+  // Agrupa por apelido (se houver) ou merchant original
   const byMerch = new Map();
   for (const l of noIOF) {
-    const key = (l.merchant || 'sem fornecedor').toUpperCase();
-    byMerch.set(key, (byMerch.get(key) || 0) + (l.amount || 0));
+    const display = groupMerchantName(l) || 'sem fornecedor';
+    const key = display.toUpperCase();
+    if (!byMerch.has(key)) byMerch.set(key, { value: 0, displayName: display });
+    byMerch.get(key).value += (l.amount || 0);
   }
   const sorted = [...byMerch.entries()]
-    .map(([nome, v]) => ({ nome, value: v }))
+    .map(([_, d]) => ({ nome: d.displayName, value: d.value }))
     .sort((a, b) => b.value - a.value)
     .slice(0, 10);
   const maxV = sorted[0].value;
@@ -3953,11 +3956,11 @@ function renderDespesasRecorrentes() {
   // Agrupa por fornecedor e mês (usa apelido quando disponível pra agrupar)
   const byMerch = new Map();
   for (const l of noIOF) {
-    const key = (merchantKey(l) || '').toUpperCase();
+    const key = (groupMerchantName(l) || '').toUpperCase();
     if (!key) continue;
     const m = lanMonthKey(l);
     if (!m) continue;
-    if (!byMerch.has(key)) byMerch.set(key, { meses: new Set(), valor: 0, count: 0, ultimoMes: '', displayName: merchantKey(l) });
+    if (!byMerch.has(key)) byMerch.set(key, { meses: new Set(), valor: 0, count: 0, ultimoMes: '', displayName: groupMerchantName(l) });
     const e = byMerch.get(key);
     e.meses.add(m);
     e.valor += l.amount || 0;
@@ -7326,7 +7329,7 @@ function openLaunchDetails(id) {
     });
   }
 
-  // Wire do botão "Aplicar apelido em todos do mesmo fornecedor"
+  // Wire do botão "Aplicar apelido em todos do mesmo fornecedor" (com sugestões automáticas)
   const btnAplicarApelido = $('btn-aplicar-apelido');
   if (btnAplicarApelido) {
     btnAplicarApelido.addEventListener('click', async () => {
@@ -7336,34 +7339,156 @@ function openLaunchDetails(id) {
       const merchant = l.merchant;
       if (!merchant) return;
 
-      // Pega TODOS os lançamentos com o mesmo merchant original
-      const mesmoFornecedor = state.lancamentos.filter(x => x.merchant === merchant);
-      const total = mesmoFornecedor.length;
+      // 1. Lançamentos com merchant IDÊNTICO (aplicação direta)
+      const exatos = state.lancamentos.filter(x => x.merchant === merchant);
 
-      const acao = apelido
-        ? `Aplicar apelido "${apelido}" em ${total} lançamento(s) com fornecedor "${merchant}"?`
-        : `Remover apelido de ${total} lançamento(s) com fornecedor "${merchant}"?`;
+      // 2. Busca SIMILARES baseados em palavras-chave significativas
+      // Tira números/asteriscos/pontuação e divide em palavras
+      const sigWords = merchant
+        .toUpperCase()
+        .replace(/[\d*\-_.,/]/g, ' ')        // remove números e pontuação
+        .split(/\s+/)
+        .filter(w => w.length >= 3)           // só palavras com 3+ letras
+        .filter(w => !['SAO','PAULO','RIO','JANEIRO','BRA','BRASIL','BR','LTDA','INTL','THE','COM','LLC','INC'].includes(w))
+        .slice(0, 3);                          // pega só as 3 primeiras "significativas"
 
-      if (!confirm(acao)) return;
-
-      mesmoFornecedor.forEach(x => {
-        x.merchantApelido = apelido || null;
-      });
-
-      // Persiste local
-      storeSet(STORE_KEYS.lancamentos, state.lancamentos);
-
-      // Sincroniza Supabase em lote (se modo ativo)
-      if (getDataMode() === 'supabase') {
-        const r = await persistLancamentosBatch(mesmoFornecedor);
-        if (!r.ok) {
-          toast('Erro ao sincronizar: ' + r.error, 'error');
-          return;
-        }
+      let similares = [];
+      if (sigWords.length > 0 && apelido) {
+        const merchantsJaExatos = new Set(exatos.map(x => x.merchant));
+        similares = state.lancamentos.filter(x => {
+          if (merchantsJaExatos.has(x.merchant)) return false;     // já está nos exatos
+          if (x.merchantApelido === apelido) return false;          // já tem MESMO apelido
+          if (x.merchantApelido && x.merchantApelido !== apelido) return false; // tem outro apelido — não mexe
+          // Casa se contém TODAS as palavras significativas
+          const m = (x.merchant || '').toUpperCase();
+          return sigWords.every(w => m.includes(w));
+        });
       }
 
-      toast(`Apelido aplicado em ${total} lançamento(s)`, 'success');
-      renderAll();
+      // Agrupa similares por merchant pra contar quantos lançamentos por variação
+      const similaresPorMerchant = new Map();
+      similares.forEach(x => {
+        const key = x.merchant;
+        if (!similaresPorMerchant.has(key)) similaresPorMerchant.set(key, 0);
+        similaresPorMerchant.set(key, similaresPorMerchant.get(key) + 1);
+      });
+
+      // Função pra aplicar de fato
+      const aplicarEm = async (lans) => {
+        lans.forEach(x => { x.merchantApelido = apelido || null; });
+        storeSet(STORE_KEYS.lancamentos, state.lancamentos);
+        if (getDataMode() === 'supabase' && lans.length > 0) {
+          const r = await persistLancamentosBatch(lans);
+          if (!r.ok) {
+            toast('Erro ao sincronizar: ' + r.error, 'error');
+            return false;
+          }
+        }
+        return true;
+      };
+
+      // Se NÃO tem similares OU está removendo apelido (sem sugestão pra remoção)
+      if (similaresPorMerchant.size === 0 || !apelido) {
+        const acao = apelido
+          ? `Aplicar apelido "${apelido}" em ${exatos.length} lançamento(s) com fornecedor "${merchant}"?`
+          : `Remover apelido de ${exatos.length} lançamento(s) com fornecedor "${merchant}"?`;
+        if (!confirm(acao)) return;
+        const ok = await aplicarEm(exatos);
+        if (ok) {
+          toast(`Apelido aplicado em ${exatos.length} lançamento(s)`, 'success');
+          renderAll();
+        }
+        return;
+      }
+
+      // Tem similares — mostra modal de confirmação
+      const palavrasTxt = sigWords.join(', ');
+      const lista = [...similaresPorMerchant.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([m, count], i) => `
+          <label style="display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: background 0.15s;">
+            <input type="checkbox" data-mig-merchant="${escapeHtml(m)}" checked style="margin-top: 3px; cursor: pointer;">
+            <div style="flex: 1; min-width: 0;">
+              <div style="font-weight: 600; font-size: 13px; word-break: break-all;">${escapeHtml(m)}</div>
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${count} lançamento(s)</div>
+            </div>
+          </label>
+        `).join('');
+
+      const totalSimilares = similares.length;
+
+      // Cria modal
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(31,42,48,0.6);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px;';
+      overlay.innerHTML = `
+        <div style="background:white;border-radius:12px;max-width:560px;width:100%;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+          <div style="padding:20px 24px;border-bottom:1px solid var(--border);">
+            <div style="font-size:16px;font-weight:700;color:var(--text);">Aplicar apelido "${escapeHtml(apelido)}"</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">Encontrei fornecedores semelhantes (palavras: <strong>${escapeHtml(palavrasTxt)}</strong>)</div>
+          </div>
+
+          <div style="padding:16px 24px;overflow-y:auto;flex:1;">
+            <div style="padding:10px 12px;background:var(--teal-light);border-radius:8px;font-size:13px;margin-bottom:14px;">
+              ✓ Vou aplicar em <strong>${exatos.length} lançamento(s)</strong> com fornecedor exato: <em>${escapeHtml(merchant)}</em>
+            </div>
+
+            <div style="font-size:12px;font-weight:600;color:var(--text-soft);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.3px;">
+              ➕ Aplicar também nesses (${totalSimilares} lançamento(s) em ${similaresPorMerchant.size} variação(ões))?
+            </div>
+
+            <div style="margin-bottom:8px; display:flex; gap:8px;">
+              <button type="button" class="btn btn-sm btn-ghost" id="mig-select-all" style="font-size:11px;padding:4px 10px;">Marcar todos</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="mig-clear-all" style="font-size:11px;padding:4px 10px;">Desmarcar todos</button>
+            </div>
+
+            ${lista}
+          </div>
+
+          <div style="padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end;">
+            <button type="button" class="btn btn-ghost" id="mig-cancel">Cancelar</button>
+            <button type="button" class="btn btn-ghost" id="mig-only-exatos">Aplicar só nos exatos</button>
+            <button type="button" class="btn btn-primary" id="mig-confirm">Aplicar nos selecionados</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      const close = () => document.body.removeChild(overlay);
+
+      overlay.querySelector('#mig-cancel').addEventListener('click', close);
+
+      overlay.querySelector('#mig-select-all').addEventListener('click', () => {
+        overlay.querySelectorAll('[data-mig-merchant]').forEach(cb => cb.checked = true);
+      });
+      overlay.querySelector('#mig-clear-all').addEventListener('click', () => {
+        overlay.querySelectorAll('[data-mig-merchant]').forEach(cb => cb.checked = false);
+      });
+
+      overlay.querySelector('#mig-only-exatos').addEventListener('click', async () => {
+        close();
+        const ok = await aplicarEm(exatos);
+        if (ok) {
+          toast(`Apelido aplicado em ${exatos.length} lançamento(s)`, 'success');
+          renderAll();
+        }
+      });
+
+      overlay.querySelector('#mig-confirm').addEventListener('click', async () => {
+        const merchantsMarcados = [...overlay.querySelectorAll('[data-mig-merchant]')]
+          .filter(cb => cb.checked)
+          .map(cb => cb.dataset.migMerchant);
+
+        const adicionais = similares.filter(x => merchantsMarcados.includes(x.merchant));
+        const todosLans = [...exatos, ...adicionais];
+
+        close();
+        const ok = await aplicarEm(todosLans);
+        if (ok) {
+          const variacoes = new Set(todosLans.map(x => x.merchant)).size;
+          toast(`Apelido aplicado em ${todosLans.length} lançamento(s) de ${variacoes} variação(ões)`, 'success');
+          renderAll();
+        }
+      });
     });
   }
 
