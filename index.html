@@ -2722,6 +2722,7 @@ async function loadAllFromSupabase() {
       amountOriginal: l.amount_original ? parseFloat(l.amount_original) : null,
       currency: l.currency,
       merchant: l.merchant,
+      merchantApelido: l.merchant_apelido || null,
       installments: l.installments || 1,
       cardId: l.card_id,
       cardName: l.card_name,
@@ -2798,6 +2799,18 @@ function uid(prefix = 'id') {
     });
   }
   return prefix + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+// Retorna o nome a ser EXIBIDO do fornecedor: apelido se houver, senão merchant original
+function displayMerchant(l) {
+  if (!l) return '';
+  return (l.merchantApelido && l.merchantApelido.trim()) || l.merchant || '';
+}
+
+// Retorna chave usada pra AGRUPAR fornecedor (usa apelido se houver, senão merchant)
+function merchantKey(l) {
+  if (!l) return '';
+  return (l.merchantApelido && l.merchantApelido.trim()) || l.merchant || '';
 }
 
 function fmtBRL(n) {
@@ -3937,14 +3950,14 @@ function renderDespesasRecorrentes() {
   // Exclui IOFs
   const noIOF = allItems.filter(l => !isIOFmerchant(l.merchant) && !l.isIOF);
 
-  // Agrupa por fornecedor e mês
+  // Agrupa por fornecedor e mês (usa apelido quando disponível pra agrupar)
   const byMerch = new Map();
   for (const l of noIOF) {
-    const key = (l.merchant || '').toUpperCase();
+    const key = (merchantKey(l) || '').toUpperCase();
     if (!key) continue;
     const m = lanMonthKey(l);
     if (!m) continue;
-    if (!byMerch.has(key)) byMerch.set(key, { meses: new Set(), valor: 0, count: 0, ultimoMes: '' });
+    if (!byMerch.has(key)) byMerch.set(key, { meses: new Set(), valor: 0, count: 0, ultimoMes: '', displayName: merchantKey(l) });
     const e = byMerch.get(key);
     e.meses.add(m);
     e.valor += l.amount || 0;
@@ -3954,7 +3967,7 @@ function renderDespesasRecorrentes() {
   // Pega fornecedores com pelo menos 2 meses
   const recorrentes = [...byMerch.entries()]
     .filter(([, d]) => d.meses.size >= 2)
-    .map(([nome, d]) => ({ nome, meses: d.meses.size, valor: d.valor, count: d.count, media: d.valor / d.meses.size, ultimoMes: d.ultimoMes }))
+    .map(([nome, d]) => ({ nome: d.displayName || nome, meses: d.meses.size, valor: d.valor, count: d.count, media: d.valor / d.meses.size, ultimoMes: d.ultimoMes }))
     .sort((a, b) => b.valor - a.valor)
     .slice(0, 10);
 
@@ -7067,7 +7080,11 @@ function renderLancamentos() {
             ${dueDate ? `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">vence ${fmtDateBR(dueDate)}</div>` : ''}
           </td>
           <td class="td-merchant row-open">
-            ${escapeHtml(l.merchant)}
+            ${l.merchantApelido
+              ? `<div style="font-weight:600;">${escapeHtml(l.merchantApelido)}</div>
+                 <div style="font-size:10px;color:var(--text-muted);margin-top:1px;font-weight:400;">${escapeHtml(l.merchant)}</div>`
+              : escapeHtml(l.merchant)
+            }
             ${l.installments > 1 ? `<span class="tag" style="margin-left:6px;">${l.installments}x</span>` : ''}
             ${l.categoriaOmie ? `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(l.categoriaOmie)}</div>` : ''}
           </td>
@@ -7179,6 +7196,18 @@ function openLaunchDetails(id) {
       <div class="field full">
         <label>Fornecedor</label>
         <div style="font-size: 15px; font-weight: 600;">${escapeHtml(l.merchant)}</div>
+      </div>
+      <div class="field full">
+        <label style="display:flex; align-items:center; gap:8px;">
+          <span>Apelido do fornecedor (agrupa em dashboards)</span>
+          <span style="font-size:10px; font-weight:400; color:var(--text-muted); padding:2px 6px; background:var(--orange-light); border-radius:4px;">opcional</span>
+        </label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input class="input" id="d-apelido" list="dl-apelidos" value="${escapeHtml(l.merchantApelido || '')}" placeholder="ex: Google Ads (deixe vazio se já está bom)" style="flex:1;">
+          <button type="button" class="btn btn-ghost" id="btn-aplicar-apelido" title="Aplica esse apelido em TODOS os lançamentos com o mesmo fornecedor" style="white-space:nowrap; padding:8px 12px; font-size:12px;">↳ Aplicar em todos</button>
+        </div>
+        <datalist id="dl-apelidos">${[...new Set(state.lancamentos.map(x => x.merchantApelido).filter(Boolean))].sort().map(v => `<option value="${escapeHtml(v)}">`).join('')}</datalist>
+        <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Use pra agrupar fornecedores que aparecem com nomes diferentes (ex: "GOOGLE ADS2801895393" e "DL *GOOGLE ADS28018953 SAO PAULO" → ambos com apelido "Google Ads")</div>
       </div>
       <div class="field full">
         <hr style="border:none; border-top: 1px solid var(--border-soft); margin: 8px 0;">
@@ -7294,6 +7323,47 @@ function openLaunchDetails(id) {
         const obs = $('d-nome-obs-wrap');
         if (obs) obs.style.display = val === 'fora' ? '' : 'none';
       });
+    });
+  }
+
+  // Wire do botão "Aplicar apelido em todos do mesmo fornecedor"
+  const btnAplicarApelido = $('btn-aplicar-apelido');
+  if (btnAplicarApelido) {
+    btnAplicarApelido.addEventListener('click', async () => {
+      const apelidoInput = $('d-apelido');
+      if (!apelidoInput) return;
+      const apelido = apelidoInput.value.trim();
+      const merchant = l.merchant;
+      if (!merchant) return;
+
+      // Pega TODOS os lançamentos com o mesmo merchant original
+      const mesmoFornecedor = state.lancamentos.filter(x => x.merchant === merchant);
+      const total = mesmoFornecedor.length;
+
+      const acao = apelido
+        ? `Aplicar apelido "${apelido}" em ${total} lançamento(s) com fornecedor "${merchant}"?`
+        : `Remover apelido de ${total} lançamento(s) com fornecedor "${merchant}"?`;
+
+      if (!confirm(acao)) return;
+
+      mesmoFornecedor.forEach(x => {
+        x.merchantApelido = apelido || null;
+      });
+
+      // Persiste local
+      storeSet(STORE_KEYS.lancamentos, state.lancamentos);
+
+      // Sincroniza Supabase em lote (se modo ativo)
+      if (getDataMode() === 'supabase') {
+        const r = await persistLancamentosBatch(mesmoFornecedor);
+        if (!r.ok) {
+          toast('Erro ao sincronizar: ' + r.error, 'error');
+          return;
+        }
+      }
+
+      toast(`Apelido aplicado em ${total} lançamento(s)`, 'success');
+      renderAll();
     });
   }
 
@@ -7523,6 +7593,12 @@ $('btn-save-details').addEventListener('click', async () => {
   l.categoriaOmie = $('d-omie').value.trim();
   l.status = $('d-status').value;
   l.note = $('d-note').value.trim();
+  // Apelido do fornecedor (opcional)
+  const apelidoInput = $('d-apelido');
+  if (apelidoInput) {
+    const apelido = apelidoInput.value.trim();
+    l.merchantApelido = apelido || null;
+  }
 
   // Salvar flag "em nome da Payfy" (se o toggle existir — IOFs não têm)
   const nomeToggle = $('d-nome-toggle');
@@ -8035,6 +8111,7 @@ function _toSupaLan(l) {
     amount_original: l.amountOriginal || null,
     currency: l.currency || null,
     merchant: l.merchant || '',
+    merchant_apelido: l.merchantApelido || null,
     installments: l.installments || 1,
     card_id: l.cardId || null,
     card_name: l.cardName || null,
@@ -8449,6 +8526,7 @@ async function migExecute() {
       amount_original: l.amountOriginal || null,
       currency: l.currency || null,
       merchant: l.merchant || '',
+      merchant_apelido: l.merchantApelido || null,
       installments: l.installments || 1,
       card_id: l.cardId ? (cardIdMap.get(l.cardId) || null) : null,  // traduz FK
       card_name: l.cardName || null,
